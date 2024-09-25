@@ -1,12 +1,13 @@
 use once_cell::sync::Lazy;
 use std::borrow::BorrowMut;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::task::{Context, Poll, Waker};
 use thiserror::Error;
 
@@ -38,12 +39,25 @@ impl ArcWake for Task {
     }
 }
 
-pub struct Marsync {
+struct MarsyncContext {
     socket_tx: mpsc::SyncSender<Arc<SocketTask>>,
     socket_rx: Option<mpsc::Receiver<Arc<SocketTask>>>,
     task_tx: mpsc::SyncSender<Arc<Task>>,
     task_rx: Option<mpsc::Receiver<Arc<Task>>>,
 }
+
+fn new_marsync() -> Arc<Mutex<MarsyncContext>> {
+    let (socket_tx, socket_rx) = mpsc::sync_channel(16);
+    let (task_tx, task_rx) = mpsc::sync_channel(16);
+    Arc::new(Mutex::new(MarsyncContext {
+        socket_tx: socket_tx,
+        socket_rx: Some(socket_rx),
+        task_rx: Some(task_rx),
+        task_tx: task_tx,
+    }))
+}
+
+static CONTEXT: LazyLock<Arc<Mutex<MarsyncContext>>> = std::sync::LazyLock::new(|| new_marsync());
 
 pub struct CreateSocket {
     ret_socket: Arc<Mutex<Option<Result<Socket, String>>>>,
@@ -68,12 +82,17 @@ impl Future for CreateSocket {
 }
 
 impl CreateSocket {
-    fn new(marsync: &Marsync, path: String) -> Self {
+    pub fn new(path: String) -> Self {
         let ret = Arc::new(Mutex::new(None));
         let waker = Arc::new(Mutex::new(None));
+        let marsync = CONTEXT.lock().unwrap();
         marsync
             .socket_tx
-            .send(Arc::new(SocketTask::Create(path, ret.clone(), waker.clone())))
+            .send(Arc::new(SocketTask::Create(
+                path,
+                ret.clone(),
+                waker.clone(),
+            )))
             .unwrap();
         CreateSocket {
             ret_socket: ret,
@@ -82,36 +101,24 @@ impl CreateSocket {
     }
 }
 
-impl Marsync {
-    pub fn create_socket(self: &Self, path: String) -> CreateSocket {
-        CreateSocket::new(self, path)
-    }
+pub fn spawn(future: impl Future<Output = ()> + 'static + Send) {
+    let marsync = CONTEXT.lock().unwrap();
+    let t = Arc::new(Task {
+        future: Mutex::new(Some(future.boxed())),
+        task_tx: marsync.task_tx.clone(),
+    });
+    marsync.task_tx.send(t).unwrap();
+}
 
-    pub fn new() -> Self {
-        let (socket_tx, socket_rx) = mpsc::sync_channel(0);
-        let (task_tx, task_rx) = mpsc::sync_channel(0);
-        Marsync {
-            socket_tx: socket_tx,
-            socket_rx: Some(socket_rx),
-            task_rx: Some(task_rx),
-            task_tx: task_tx,
-        }
-    }
-
-    pub fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) {
-        let t = Arc::new(Task{
-            future: Mutex::new(Some(future.boxed())),
-            task_tx: self.task_tx.clone(),
-        });
-        self.task_tx.send(t).unwrap();
-    }
-
-    pub fn run(&mut self) {
-        let socket_rx = self.socket_rx.take().unwrap();
-        let task_rx = self.task_rx.take().unwrap();
-        std::thread::spawn(|| socket_thread(socket_rx));
-        std::thread::spawn(|| executor_thread(task_rx));
-    }
+pub fn run() {
+    let mut marsync = CONTEXT.lock().unwrap();
+    let socket_rx = marsync.socket_rx.take().unwrap();
+    let task_rx = marsync.task_rx.take().unwrap();
+    drop(marsync);
+    let t1 = std::thread::spawn(|| socket_thread(socket_rx));
+    let t2 = std::thread::spawn(|| executor_thread(task_rx));
+    t1.join().unwrap();
+    t2.join().unwrap();
 }
 
 fn socket_thread(socket_rx: mpsc::Receiver<Arc<SocketTask>>) {
