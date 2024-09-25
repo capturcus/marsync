@@ -1,0 +1,9 @@
+[package]
+name = "marsync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "*"
+once_cell = "*"
+futures = "*"
