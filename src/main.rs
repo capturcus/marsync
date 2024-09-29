@@ -1,24 +1,28 @@
 #![feature(unix_socket_peek)]
 
-use std::{
-    io::{self, Read},
-    os::unix::net::UnixStream,
-    time::Duration,
-};
 pub mod marsync;
 
 async fn async_main() {
-    let s = marsync::create_socket(String::from("/tmp/test.sock")).await;
+    let s = marsync::connect(String::from("/tmp/test.sock")).await;
+    println!("got socket");
     loop {
         match s {
             Ok(ref s) => {
-                println!("got socket");
                 let mut buf = [0; 32];
                 let n = s.read(&mut buf).await.unwrap();
-                println!("n {}", n);
-                println!("data {:#?}", buf);
+                if n == 0 {
+                    return;
+                }
+                let data = String::from_utf8(buf.to_vec()).unwrap();
+                println!("received: {}", data);
+                buf[0] = b'a';
+                let o = s.write(&buf).await.unwrap();
+                println!("sent: {}", o);
             }
-            Err(ref e) => println!("socket err {}", e),
+            Err(ref e) => {
+                println!("socket err {}", e);
+                return;
+            }
         }
     }
 }
