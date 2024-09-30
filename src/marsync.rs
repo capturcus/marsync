@@ -70,7 +70,7 @@ fn new_marsync() -> Arc<Mutex<MarsyncContext>> {
     }))
 }
 
-static CONTEXT: LazyLock<Arc<Mutex<MarsyncContext>>> = std::sync::LazyLock::new(|| new_marsync());
+static CONTEXT: LazyLock<Arc<Mutex<MarsyncContext>>> = std::sync::LazyLock::new(new_marsync);
 const SOCKET_THREAD_NUM: usize = 3;
 const EXECUTOR_THREAD_NUM: usize = 3;
 
@@ -119,17 +119,17 @@ impl ConnectSocket {
 }
 
 impl Socket {
-    pub fn read<'a, const T: usize>(&self, buf: &'a mut [u8; T]) -> BlockingSocketOp<'a, T> {
+    pub fn read<'a>(&self, buf: &'a mut [u8]) -> BlockingSocketOp<'a> {
         BlockingSocketOp {
             read_data: Some(buf),
             waker: Arc::new(Mutex::new(None)),
             s: self.s.clone(),
             socket_op_status: Arc::new(Mutex::new(Ok(0))),
             op: SocketOp::Read,
-            write_data: &[0; T],
+            write_data: &[0],
         }
     }
-    pub fn write<'a>(&self, buf: &'a [u8]) -> BlockingSocketOp<'a, 0> {
+    pub fn write<'a>(&self, buf: &'a [u8]) -> BlockingSocketOp<'a> {
         BlockingSocketOp {
             read_data: None,
             waker: Arc::new(Mutex::new(None)),
@@ -141,8 +141,8 @@ impl Socket {
     }
 }
 
-pub struct BlockingSocketOp<'a, const T: usize> {
-    read_data: Option<&'a mut [u8; T]>,
+pub struct BlockingSocketOp<'a> {
+    read_data: Option<&'a mut [u8]>,
     write_data: &'a [u8],
     waker: Arc<Mutex<Option<Waker>>>,
     s: Arc<Mutex<UnixStream>>,
@@ -150,7 +150,7 @@ pub struct BlockingSocketOp<'a, const T: usize> {
     op: SocketOp,
 }
 
-impl<'a, const T: usize> Future for BlockingSocketOp<'a, T> {
+impl<'a> Future for BlockingSocketOp<'a> {
     type Output = io::Result<usize>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -313,7 +313,7 @@ fn socket_thread(socket_rx: Arc<Mutex<mpsc::Receiver<Arc<SocketTask>>>>) {
                 socket_thread_connect(path, task_ret, waker)
             }
             SocketTask::SocketBlockingOp(s_arc, waker, res, op) => {
-                socket_thread_wait_for_op(s_arc, waker, res, op.clone())
+                socket_thread_wait_for_op(s_arc, waker, res, *op)
             }
             SocketTask::NextClient(listener, waker_slot, result_socket_slot) => {
                 socket_thread_next_client(listener, waker_slot, result_socket_slot)

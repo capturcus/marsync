@@ -1,7 +1,5 @@
 #![feature(unix_socket_peek)]
 
-use std::time::Duration;
-
 use futures::StreamExt;
 
 pub mod marsync;
@@ -23,7 +21,7 @@ async fn run_listener(l: marsync::Listener) {
                     let m = s.write(ret.as_bytes()).await.unwrap();
                     println!("server sent {}", m);
                 },
-                Err(e) => println!("next err {}", e.to_string()),
+                Err(e) => println!("next err {}", e),
             }
         })
         .collect::<Vec<_>>()
