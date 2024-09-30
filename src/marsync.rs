@@ -1,20 +1,13 @@
-use once_cell::sync::Lazy;
-use std::borrow::BorrowMut;
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
-use std::error::Error;
-use std::ffi::FromBytesUntilNulError;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
-use thiserror::Error;
 
+use futures::Stream;
 use futures::{
     future::{BoxFuture, FutureExt},
     task::{waker_ref, ArcWake},
@@ -35,6 +28,11 @@ enum SocketTask {
         Arc<Mutex<Option<Waker>>>,
         Arc<Mutex<Result<usize, io::Error>>>,
         SocketOp,
+    ),
+    NextClient(
+        Arc<Mutex<UnixListener>>,
+        Arc<Mutex<Option<Waker>>>,
+        Arc<Mutex<Option<Result<Socket, String>>>>,
     ),
 }
 
@@ -131,7 +129,7 @@ impl Socket {
             write_data: &[0; T],
         }
     }
-    pub fn write<'a, const T: usize>(&self, buf: &'a [u8; T]) -> BlockingSocketOp<'a, T> {
+    pub fn write<'a>(&self, buf: &'a [u8]) -> BlockingSocketOp<'a, 0> {
         BlockingSocketOp {
             read_data: None,
             waker: Arc::new(Mutex::new(None)),
@@ -145,7 +143,7 @@ impl Socket {
 
 pub struct BlockingSocketOp<'a, const T: usize> {
     read_data: Option<&'a mut [u8; T]>,
-    write_data: &'a [u8; T],
+    write_data: &'a [u8],
     waker: Arc<Mutex<Option<Waker>>>,
     s: Arc<Mutex<UnixStream>>,
     socket_op_status: Arc<Mutex<Result<usize, io::Error>>>,
@@ -167,12 +165,9 @@ impl<'a, const T: usize> Future for BlockingSocketOp<'a, T> {
         let ret;
         match self.op {
             SocketOp::Read => {
-                let x = self.read_data.take().unwrap();
-                ret = other_s
-                    .lock()
-                    .unwrap()
-                    .read(x);
-                self.read_data = Some(x);
+                let read_buf = self.read_data.take().unwrap();
+                ret = other_s.lock().unwrap().read(read_buf);
+                self.read_data = Some(read_buf);
             }
             SocketOp::Write => {
                 ret = other_s.lock().unwrap().write(self.write_data);
@@ -289,6 +284,24 @@ fn socket_thread_wait_for_op(
     }
 }
 
+fn socket_thread_next_client(
+    listener: &Arc<Mutex<UnixListener>>,
+    waker_slot: &Arc<Mutex<Option<Waker>>>,
+    result_socket_slot: &Arc<Mutex<Option<Result<Socket, String>>>>,
+) {
+    match listener.lock().unwrap().accept() {
+        Ok((s, _)) => {
+            *result_socket_slot.lock().unwrap() = Some(Ok(Socket {
+                s: Arc::new(Mutex::new(s)),
+            }))
+        }
+        Err(e) => *result_socket_slot.lock().unwrap() = Some(Err(e.to_string())),
+    }
+    if let Some(w) = waker_slot.lock().unwrap().take() {
+        w.wake();
+    }
+}
+
 fn socket_thread(socket_rx: Arc<Mutex<mpsc::Receiver<Arc<SocketTask>>>>) {
     loop {
         let socket_task;
@@ -301,6 +314,9 @@ fn socket_thread(socket_rx: Arc<Mutex<mpsc::Receiver<Arc<SocketTask>>>>) {
             }
             SocketTask::SocketBlockingOp(s_arc, waker, res, op) => {
                 socket_thread_wait_for_op(s_arc, waker, res, op.clone())
+            }
+            SocketTask::NextClient(listener, waker_slot, result_socket_slot) => {
+                socket_thread_next_client(listener, waker_slot, result_socket_slot)
             }
         }
     }
@@ -354,5 +370,57 @@ fn wait_for_socket_op(stream: &UnixStream, op: SocketOp) -> io::Result<bool> {
         -1 => Err(io::Error::last_os_error()),
         0 => Ok(false), // Timeout
         _ => Ok(unsafe { libc::FD_ISSET(fd, &fds) }),
+    }
+}
+
+pub struct NextClient {
+    waker_slot: Arc<Mutex<Option<Waker>>>,
+    result_socket_slot: Arc<Mutex<Option<Result<Socket, String>>>>,
+}
+
+impl Stream for NextClient {
+    type Item = Result<Socket, String>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        *self.waker_slot.lock().unwrap() = Some(cx.waker().clone());
+        let mut s = self.result_socket_slot.lock().unwrap();
+        if s.is_none() {
+            return Poll::Pending;
+        }
+        let res = s.take().unwrap();
+        Poll::Ready(Some(res))
+    }
+}
+
+pub struct Listener {
+    l: Arc<Mutex<UnixListener>>,
+}
+
+impl Listener {
+    pub fn next(&self) -> NextClient {
+        let marsync = CONTEXT.lock().unwrap();
+        let waker_slot = Arc::new(Mutex::new(None));
+        let result_socket_slot = Arc::new(Mutex::new(None));
+        marsync
+            .socket_tx
+            .lock()
+            .unwrap()
+            .send(Arc::new(SocketTask::NextClient(
+                self.l.clone(),
+                waker_slot.clone(),
+                result_socket_slot.clone(),
+            )))
+            .unwrap();
+        NextClient {
+            waker_slot,
+            result_socket_slot,
+        }
+    }
+}
+
+pub fn create_listener(path: String) -> Listener {
+    let l = UnixListener::bind(path).unwrap();
+    Listener {
+        l: Arc::new(Mutex::new(l)),
     }
 }
