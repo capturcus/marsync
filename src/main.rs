@@ -1,26 +1,32 @@
-#![feature(unix_socket_peek)]
-
 use futures::StreamExt;
 
 pub mod marsync;
+
+const BUF_SIZE: usize = 32;
 
 async fn run_listener(l: marsync::Listener) {
     println!("running listener");
     l.next()
         .then(|r| async move {
             match r {
-                Ok(s) => loop {
-                    let mut buf = [0; 32];
-                    let n = s.read(&mut buf).await.unwrap();
-                    println!("server received {}", n);
-                    if n == 0 {
-                        break;
+                Ok(s) => {
+                    println!("got socket");
+                    loop {
+                        let mut buf = [0; BUF_SIZE];
+                        let n = s.read(&mut buf).await.unwrap();
+                        println!("server received {}", n);
+                        if n == 0 {
+                            break;
+                        }
+                        let data = String::from_utf8(buf.to_vec())
+                            .unwrap()
+                            .trim_matches('\0')
+                            .to_string();
+                        let ret = format!("received: {}", data);
+                        let m = s.write(ret.as_bytes()).await.unwrap();
+                        println!("server sent {}", m);
                     }
-                    let data = String::from_utf8(buf.to_vec()).unwrap().trim_matches('\0').to_string();
-                    let ret = format!("received: {}", data);
-                    let m = s.write(ret.as_bytes()).await.unwrap();
-                    println!("server sent {}", m);
-                },
+                }
                 Err(e) => println!("next err {}", e),
             }
         })
@@ -30,17 +36,19 @@ async fn run_listener(l: marsync::Listener) {
 
 async fn async_main() {
     let _ = std::fs::remove_file("/tmp/test.sock");
-    let l = marsync::create_listener(String::from("/tmp/test.sock"));
+    let l = marsync::create_listener("/tmp/test.sock");
     marsync::spawn(run_listener(l));
-    let s = marsync::connect(String::from("/tmp/test.sock")).await;
-    println!("connect");
     loop {
+        let s = marsync::connect(String::from("/tmp/test.sock"))
+            .unwrap()
+            .await;
+        println!("connect");
         match s {
             Ok(ref s) => {
-                let test = String::from("siemka tasiemka");
+                let test = String::from("siemka tasiemka ").repeat(BUF_SIZE / 16 - 1);
                 let n = s.write(test.as_bytes()).await.unwrap();
                 println!("client sent {}", n);
-                let mut buf = [0; 32];
+                let mut buf = [0; BUF_SIZE];
                 let m = s.read(&mut buf).await.unwrap();
                 println!("client received {}", m);
                 let ret = String::from_utf8(Vec::from(buf)).unwrap();

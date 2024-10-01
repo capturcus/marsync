@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 thiserror = "*"
-once_cell = "*"
 futures = "*"
 libc = "0.2"
+either = "*"
