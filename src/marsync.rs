@@ -23,18 +23,12 @@ pub enum MarsyncError {
 
     #[error("send error")]
     SendError(String),
-
-    #[error("?")]
-    Stuff(#[from] std::sync::mpsc::SendError<SocketTask>),
 }
 
 /*
 todo
 
-socket stream next client - zmienic nazwę
-zrefaktorować blocking read op na bez polli
 pozbyć się futures
-zrefaktorować sockettask na trait i trzy structy
 
 */
 
@@ -45,20 +39,78 @@ pub struct Socket {
     s: Arc<Mutex<UnixStream>>,
 }
 
-enum SocketTask {
-    Connect {
-        path: String,
-        tx: Option<oneshot::Sender<Result<Socket, MarsyncError>>>,
-    },
-    SocketBlockingOp {
-        s: Arc<Mutex<UnixStream>>,
-        tx: Option<oneshot::Sender<Option<MarsyncError>>>,
-        op: SocketOp,
-    },
-    NextClient {
-        l: Arc<Mutex<UnixListener>>,
-        tx: futures::channel::mpsc::Sender<Result<Socket, MarsyncError>>,
-    },
+trait SocketTask {
+    fn oneshot_workload(self: Box<Self>);
+}
+
+struct SocketCreate {
+    path: String,
+    tx: oneshot::Sender<Result<Socket, MarsyncError>>,
+}
+
+impl SocketTask for SocketCreate {
+    fn oneshot_workload(self: Box<Self>) {
+        let res = UnixStream::connect(self.path);
+        match res {
+            Ok(s) => {
+                s.set_nonblocking(true).unwrap();
+                let ret = Ok(Socket {
+                    s: Arc::new(Mutex::new(s)),
+                });
+                self.tx.send(ret).expect("internal error")
+            }
+            Err(e) => self.tx.send(Err(e.into())).expect("internal error"),
+        }
+    }
+}
+
+struct SocketBlockingOp {
+    s: Arc<Mutex<UnixStream>>,
+    tx: oneshot::Sender<Option<MarsyncError>>,
+    op: SocketOp,
+}
+
+impl SocketTask for SocketBlockingOp {
+    fn oneshot_workload(self: Box<Self>) {
+        let s = self.s.lock().expect("lock failed");
+        match wait_for_socket_op(&s, self.op) {
+            Some(e) => self.tx.send(Some(e.into())).expect("internal error"),
+            None => self.tx.send(None).expect("internal error"),
+        }
+    }
+}
+
+struct SocketNextClient {
+    l: Arc<Mutex<UnixListener>>,
+    tx: futures::channel::mpsc::Sender<Result<Socket, MarsyncError>>,
+}
+
+impl SocketTask for SocketNextClient {
+    fn oneshot_workload(mut self: Box<Self>) {
+        loop {
+            match self.l.lock().expect("lock failed").accept() {
+                Ok((s, _)) => self.tx
+                    .start_send(Ok(Socket {
+                        s: Arc::new(Mutex::new(s)),
+                    }))
+                    .expect("internal error"),
+                Err(e) => self.tx.start_send(Err(e.into())).expect("internal error"),
+            }
+        }
+    }
+}
+
+fn socket_thread(
+    socket_rx: Arc<
+        std::sync::Mutex<
+            std::sync::mpsc::Receiver<Box<(dyn SocketTask + std::marker::Send + Sync + 'static)>>,
+        >,
+    >,
+) {
+    loop {
+        let socket_task = socket_rx.lock().expect("lock failed").recv().unwrap();
+        socket_task.oneshot_workload();
+    }
 }
 
 struct Task {
@@ -78,8 +130,8 @@ impl ArcWake for Task {
 }
 
 struct MarsyncContext {
-    socket_tx: Arc<Mutex<mpsc::SyncSender<SocketTask>>>,
-    socket_rx: Arc<Mutex<mpsc::Receiver<SocketTask>>>,
+    socket_tx: Arc<Mutex<mpsc::SyncSender<Box<dyn SocketTask + Send + Sync>>>>,
+    socket_rx: Arc<Mutex<mpsc::Receiver<Box<dyn SocketTask + Send + Sync>>>>,
     task_tx: Arc<Mutex<mpsc::SyncSender<Arc<Task>>>>,
     task_rx: Arc<Mutex<mpsc::Receiver<Arc<Task>>>>,
 }
@@ -110,11 +162,11 @@ fn send_op_oneshot(
         .socket_tx
         .lock()
         .unwrap()
-        .send(SocketTask::SocketBlockingOp {
+        .send(Box::new(SocketBlockingOp {
             s,
-            tx: Some(tx),
+            tx,
             op,
-        })
+        }))
         .unwrap();
     rx
 }
@@ -194,7 +246,7 @@ pub fn run() {
     let mut handles = Vec::new();
     for _ in 0..SOCKET_THREAD_NUM {
         let new_socket_rx = socket_rx.clone();
-        handles.push(std::thread::spawn(move || socket_thread(&new_socket_rx)));
+        handles.push(std::thread::spawn(move || socket_thread(new_socket_rx)));
     }
     for _ in 0..EXECUTOR_THREAD_NUM {
         let new_task_rx = task_rx.clone();
@@ -205,67 +257,10 @@ pub fn run() {
     }
 }
 
-fn socket_thread_connect(path: &str, tx: oneshot::Sender<Result<Socket, MarsyncError>>) {
-    let res = UnixStream::connect(path);
-    match res {
-        Ok(s) => {
-            s.set_nonblocking(true).unwrap();
-            let ret = Ok(Socket {
-                s: Arc::new(Mutex::new(s)),
-            });
-            tx.send(ret).expect("internal error")
-        }
-        Err(e) => tx.send(Err(e.into())).expect("internal error"),
-    }
-}
-
 #[derive(PartialEq, Debug, Clone, Copy)]
 enum SocketOp {
     Read,
     Write,
-}
-
-fn socket_thread_wait_for_op(
-    s_arc: &Mutex<UnixStream>,
-    tx: oneshot::Sender<Option<MarsyncError>>,
-    op: SocketOp,
-) {
-    let s = s_arc.lock().expect("lock failed");
-    match wait_for_socket_op(&s, op) {
-        Some(e) => tx.send(Some(e.into())).expect("internal error"),
-        None => tx.send(None).expect("internal error"),
-    }
-}
-
-fn socket_thread_next_client(
-    listener: &Mutex<UnixListener>,
-    tx: &mut futures::channel::mpsc::Sender<Result<Socket, MarsyncError>>,
-) {
-    loop {
-        match listener.lock().expect("lock failed").accept() {
-            Ok((s, _)) => tx
-                .start_send(Ok(Socket {
-                    s: Arc::new(Mutex::new(s)),
-                }))
-                .expect("internal error"),
-            Err(e) => tx.start_send(Err(e.into())).expect("internal error"),
-        }
-    }
-}
-
-fn socket_thread(socket_rx: &Mutex<mpsc::Receiver<SocketTask>>) {
-    loop {
-        let socket_task = socket_rx.lock().expect("lock failed").recv().unwrap();
-        match socket_task {
-            SocketTask::Connect { path, tx } => {
-                socket_thread_connect(&path, tx.expect("internal error"))
-            }
-            SocketTask::SocketBlockingOp { s, tx, op } => {
-                socket_thread_wait_for_op(&s, tx.expect("internal error"), op)
-            }
-            SocketTask::NextClient { l, mut tx } => socket_thread_next_client(&l, &mut tx),
-        }
-    }
 }
 
 fn executor_thread(task_rx: Arc<Mutex<mpsc::Receiver<Arc<Task>>>>) {
@@ -290,10 +285,10 @@ pub fn connect(path: String) -> oneshot::Receiver<Result<Socket, MarsyncError>> 
         .socket_tx
         .lock()
         .expect("lock failed")
-        .send(SocketTask::Connect {
+        .send(Box::new(SocketCreate {
             path: path.to_owned(),
-            tx: Some(tx),
-        })
+            tx,
+        }))
         .expect("internal error");
     rx
 }
@@ -364,7 +359,7 @@ pub fn create_listener(path: &str) -> Listener {
         .socket_tx
         .lock()
         .unwrap()
-        .send(SocketTask::NextClient { l: l.clone(), tx })
+        .send(Box::new(SocketNextClient { l: l.clone(), tx }))
         .unwrap();
     Listener { rx }
 }
