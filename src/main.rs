@@ -4,34 +4,32 @@ pub mod marsync;
 
 const BUF_SIZE: usize = 32;
 
-async fn run_listener(l: marsync::Listener) {
+async fn run_listener(mut l: marsync::Listener) {
     println!("running listener");
-    l.next()
-        .then(|r| async move {
-            match r {
-                Ok(s) => {
-                    println!("got socket");
-                    loop {
-                        let mut buf = [0; BUF_SIZE];
-                        let n = s.read(&mut buf).await.unwrap();
-                        println!("server received {}", n);
-                        if n == 0 {
-                            break;
-                        }
-                        let data = String::from_utf8(buf.to_vec())
-                            .unwrap()
-                            .trim_matches('\0')
-                            .to_string();
-                        let ret = format!("received: {}", data);
-                        let m = s.write(ret.as_bytes()).await.unwrap();
-                        println!("server sent {}", m);
+    loop {
+        let r = l.next().await;
+        match r {
+            Ok(s) => {
+                println!("got socket");
+                loop {
+                    let mut buf = [0; BUF_SIZE];
+                    let n = s.read(&mut buf).await.unwrap();
+                    println!("server received {}", n);
+                    if n == 0 {
+                        break;
                     }
+                    let data = String::from_utf8(buf.to_vec())
+                        .unwrap()
+                        .trim_matches('\0')
+                        .to_string();
+                    let ret = format!("received: {}", data);
+                    let m = s.write(ret.as_bytes()).await.unwrap();
+                    println!("server sent {}", m);
                 }
-                Err(e) => println!("next err {}", e),
             }
-        })
-        .collect::<Vec<_>>()
-        .await;
+            Err(e) => println!("next err {}", e),
+        }
+    }
 }
 
 async fn async_main() {
@@ -40,8 +38,8 @@ async fn async_main() {
     marsync::spawn(run_listener(l));
     loop {
         let s = marsync::connect(String::from("/tmp/test.sock"))
-            .unwrap()
-            .await;
+            .await
+            .unwrap();
         println!("connect");
         match s {
             Ok(ref s) => {
