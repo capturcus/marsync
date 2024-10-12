@@ -2,15 +2,17 @@
 
 pub mod marsync;
 
-const BUF_SIZE: usize = 32;
+const BUF_SIZE: usize = 64;
 
 async fn run_listener(mut l: marsync::Listener) {
     println!("running listener");
+    let mut i: u64 = 0;
     loop {
         let r = l.next().await;
         match r {
             Ok(s) => {
-                println!("got socket");
+                i += 1;
+                println!("got socket {}", i);
                 loop {
                     let mut buf = [0; BUF_SIZE];
                     let n = s.read(&mut buf).await.unwrap();
@@ -36,10 +38,12 @@ async fn async_main() {
     let _ = std::fs::remove_file("/tmp/test.sock");
     let l = marsync::create_listener("/tmp/test.sock");
     marsync::spawn(run_listener(l));
+    let mut i: u64 = 0;
     loop {
         let s = marsync::connect(String::from("/tmp/test.sock"))
             .await;
-        println!("connect");
+        i += 1;
+        println!("connect {}", i);
         match s {
             Ok(ref s) => {
                 let test = String::from("siemka tasiemka ").repeat(BUF_SIZE / 16 - 1);

@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::Context;
 
 use futures::task::{waker_ref, ArcWake};
 use futures::StreamExt;
@@ -12,6 +12,7 @@ use futures::StreamExt;
 use libc::{pollfd, POLLIN, POLLOUT};
 use thiserror::Error;
 
+mod oneshot;
 mod socket_thread;
 
 #[derive(Error, Debug)]
@@ -21,60 +22,6 @@ pub enum MarsyncError {
 
     #[error("send error")]
     SendError(String),
-}
-
-/*
-todo
-
-pozbyć się futures
-
-*/
-
-struct OneshotSender<T> {
-    value: Arc<Mutex<Option<T>>>,
-    waker: Arc<Mutex<Option<Waker>>>,
-}
-
-pub struct OneshotReceiver<T> {
-    value: Arc<Mutex<Option<T>>>,
-    waker: Arc<Mutex<Option<Waker>>>,
-}
-
-impl<T> Future for OneshotReceiver<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        let mut val_guard = self.value.lock().expect("lock failed");
-        if val_guard.is_some() {
-            return Poll::Ready(val_guard.take().unwrap());
-        }
-        drop(val_guard);
-        *self.waker.lock().expect("lock failed") = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-
-impl<T> OneshotSender<T> {
-    fn send(self, t: T) {
-        *self.value.lock().expect("lock failed") = Some(t);
-        let mut waker_guard = self.waker.lock().expect("lock failed");
-        if waker_guard.is_some() {
-            let w = waker_guard.take().unwrap();
-            w.wake();
-        }
-    }
-}
-
-fn create_oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
-    let value = Arc::new(Mutex::new(None));
-    let waker = Arc::new(Mutex::new(None));
-    (
-        OneshotSender {
-            value: value.clone(),
-            waker: waker.clone(),
-        },
-        OneshotReceiver { value, waker },
-    )
 }
 
 /// An async UNIX socket.
@@ -126,9 +73,9 @@ const TASK_QUEUE_LEN: usize = 16;
 fn send_op_oneshot(
     s: Arc<Mutex<UnixStream>>,
     op: SocketOp,
-) -> OneshotReceiver<Option<MarsyncError>> {
+) -> oneshot::Receiver<Option<MarsyncError>> {
     let marsync = CONTEXT.lock().expect("lock failed");
-    let (tx, rx) = create_oneshot();
+    let (tx, rx) = oneshot::new();
     marsync
         .socket_tx
         .lock()
@@ -155,10 +102,9 @@ impl Socket {
         }
         let rx = send_op_oneshot(self.s.clone(), SocketOp::Read);
         let ret = rx.await;
-        match ret {
-            Some(err) => return Err(err),
-            None => {}
-        };
+        if let Some(err) = ret {
+            return Err(err);
+        }
 
         let mut socket = s.lock().expect("lock failed");
         Ok(socket.read(buf)?)
@@ -179,11 +125,9 @@ impl Socket {
         }
         let rx = send_op_oneshot(self.s.clone(), SocketOp::Write);
         let ret = rx.await;
-        match ret {
-            Some(err) => return Err(err),
-            None => {}
-        };
-
+        if let Some(err) = ret {
+            return Err(err);
+        }
         let mut socket = s.lock().expect("lock failed");
         Ok(socket.write(buf)?)
     }
@@ -247,9 +191,9 @@ fn executor_thread(task_rx: Arc<Mutex<mpsc::Receiver<Arc<Task>>>>) {
 }
 
 /// Returns a future that on completion will have connected to a UNIX socket.
-pub fn connect(path: String) -> OneshotReceiver<Result<Socket, MarsyncError>> {
+pub fn connect(path: String) -> oneshot::Receiver<Result<Socket, MarsyncError>> {
     let marsync = CONTEXT.lock().expect("lock failed");
-    let (tx, rx) = create_oneshot();
+    let (tx, rx) = oneshot::new();
     marsync
         .socket_tx
         .lock()

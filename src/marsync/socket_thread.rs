@@ -1,5 +1,7 @@
 
 
+use oneshot::Sender;
+
 use super::*;
 
 
@@ -9,7 +11,7 @@ pub trait SocketTask {
 
 pub struct SocketCreate {
     pub path: String,
-    pub tx: OneshotSender<Result<Socket, MarsyncError>>,
+    pub tx: Sender<Result<Socket, MarsyncError>>,
 }
 
 impl SocketTask for SocketCreate {
@@ -30,7 +32,7 @@ impl SocketTask for SocketCreate {
 
 pub struct SocketBlockingOp {
     pub s: Arc<Mutex<UnixStream>>,
-    pub tx: OneshotSender<Option<MarsyncError>>,
+    pub tx: Sender<Option<MarsyncError>>,
     pub op: SocketOp,
 }
 
