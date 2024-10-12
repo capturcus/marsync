@@ -1,4 +1,4 @@
-use futures::StreamExt;
+
 
 pub mod marsync;
 
@@ -38,8 +38,7 @@ async fn async_main() {
     marsync::spawn(run_listener(l));
     loop {
         let s = marsync::connect(String::from("/tmp/test.sock"))
-            .await
-            .unwrap();
+            .await;
         println!("connect");
         match s {
             Ok(ref s) => {
