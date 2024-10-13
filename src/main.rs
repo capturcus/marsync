@@ -1,5 +1,3 @@
-
-
 pub mod marsync;
 
 const BUF_SIZE: usize = 64;
@@ -40,8 +38,7 @@ async fn async_main() {
     marsync::spawn(run_listener(l));
     let mut i: u64 = 0;
     loop {
-        let s = marsync::connect(String::from("/tmp/test.sock"))
-            .await;
+        let s = marsync::connect(String::from("/tmp/test.sock")).await;
         i += 1;
         println!("connect {}", i);
         match s {

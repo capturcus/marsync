@@ -1,5 +1,9 @@
-use std::{future::Future, pin::Pin, sync::{Arc, Mutex}, task::{Context, Poll, Waker}};
-
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
+};
 
 struct Shared<T> {
     value: Option<T>,
@@ -19,8 +23,8 @@ impl<T> Future for Receiver<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let mut shared = self.shared.lock().expect("lock failed");
-        if shared.value.is_some() {
-            return Poll::Ready(shared.value.take().unwrap());
+        if let Some(v) = shared.value.take() {
+            return Poll::Ready(v);
         }
         shared.waker = Some(cx.waker().clone());
         Poll::Pending
@@ -31,8 +35,7 @@ impl<T> Sender<T> {
     pub fn send(self, t: T) {
         let mut shared = self.shared.lock().expect("lock failed");
         shared.value = Some(t);
-        if shared.waker.is_some() {
-            let w = shared.waker.take().unwrap();
+        if let Some(w) = shared.waker.take() {
             w.wake();
         }
     }

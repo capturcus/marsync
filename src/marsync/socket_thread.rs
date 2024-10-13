@@ -1,9 +1,6 @@
-
-
 use oneshot::Sender;
 
 use super::*;
-
 
 pub trait SocketTask {
     fn oneshot_workload(self: Box<Self>);
@@ -55,7 +52,8 @@ impl SocketTask for SocketNextClient {
     fn oneshot_workload(mut self: Box<Self>) {
         loop {
             match self.l.lock().expect("lock failed").accept() {
-                Ok((s, _)) => self.tx
+                Ok((s, _)) => self
+                    .tx
                     .start_send(Ok(Socket {
                         s: Arc::new(Mutex::new(s)),
                     }))
@@ -76,5 +74,49 @@ pub fn socket_thread(
     loop {
         let socket_task = socket_rx.lock().expect("lock failed").recv().unwrap();
         socket_task.oneshot_workload();
+    }
+}
+
+fn wait_for_socket_op(stream: &UnixStream, op: SocketOp) -> Option<io::Error> {
+    let events = match op {
+        SocketOp::Read => POLLIN,
+        SocketOp::Write => POLLOUT,
+    };
+
+    let mut fds = [pollfd {
+        fd: stream.as_raw_fd(),
+        events,
+        revents: 0,
+    }];
+    loop {
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+
+        match result {
+            -1 => {
+                let err = io::Error::last_os_error();
+                eprintln!("poll failed: {}", err);
+                return Some(err);
+            }
+            0 => {
+                println!("Timed out!");
+                return None;
+            }
+            _ => match op {
+                SocketOp::Read => {
+                    if fds[0].revents & POLLIN != 0 {
+                        return None;
+                    } else {
+                        continue;
+                    }
+                }
+                SocketOp::Write => {
+                    if fds[0].revents & POLLOUT != 0 {
+                        return None;
+                    } else {
+                        continue;
+                    }
+                }
+            },
+        }
     }
 }

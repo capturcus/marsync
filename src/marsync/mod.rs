@@ -19,9 +19,6 @@ mod socket_thread;
 pub enum MarsyncError {
     #[error("io error")]
     Io(#[from] io::Error),
-
-    #[error("send error")]
-    SendError(String),
 }
 
 /// An async UNIX socket.
@@ -149,7 +146,7 @@ pub fn spawn(future: impl Future<Output = ()> + 'static + Send) {
 }
 
 /// Starts the reactor. This never returns. Make sure to spawn the entry point to the async app before running this.
-pub fn run() {
+pub fn run() -> ! {
     let marsync = CONTEXT.lock().expect("lock failed");
     let socket_rx = marsync.socket_rx.clone();
     let task_rx = marsync.task_rx.clone();
@@ -168,6 +165,7 @@ pub fn run() {
     for h in handles {
         h.join().unwrap();
     }
+    panic!("infinite loops returned")
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -206,57 +204,13 @@ pub fn connect(path: String) -> oneshot::Receiver<Result<Socket, MarsyncError>> 
     rx
 }
 
-fn wait_for_socket_op(stream: &UnixStream, op: SocketOp) -> Option<io::Error> {
-    let events = match op {
-        SocketOp::Read => POLLIN,
-        SocketOp::Write => POLLOUT,
-    };
-
-    let mut fds = [pollfd {
-        fd: stream.as_raw_fd(),
-        events,
-        revents: 0,
-    }];
-    loop {
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
-
-        match result {
-            -1 => {
-                let err = io::Error::last_os_error();
-                eprintln!("poll failed: {}", err);
-                return Some(err);
-            }
-            0 => {
-                println!("Timed out!");
-                return None;
-            }
-            _ => match op {
-                SocketOp::Read => {
-                    if fds[0].revents & POLLIN != 0 {
-                        return None;
-                    } else {
-                        continue;
-                    }
-                }
-                SocketOp::Write => {
-                    if fds[0].revents & POLLOUT != 0 {
-                        return None;
-                    } else {
-                        continue;
-                    }
-                }
-            },
-        }
-    }
-}
-
 /// A UNIX listener. Can be used to spawn new marsync::Sockets to communicate with clients.
 pub struct Listener {
     rx: futures::channel::mpsc::Receiver<Result<Socket, MarsyncError>>,
 }
 
 impl Listener {
-    /// Returns a stream that will yield marsync::Sockets for incoming clients.
+    /// Returns a future that will yield the next marsync::Socket for incoming clients.
     pub async fn next(&mut self) -> Result<Socket, MarsyncError> {
         self.rx.next().await.expect("internal error")
     }
